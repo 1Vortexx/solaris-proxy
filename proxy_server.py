@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Solaris Browser Proxy Server - Render Deployment
@@ -119,7 +118,7 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_cors_headers()
                 self.end_headers()
                 
-                # Modify HTML content if needed
+                # Modify content if needed
                 if 'text/html' in content_type.lower():
                     try:
                         html_content = response_data.decode('utf-8', errors='ignore')
@@ -127,6 +126,14 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                         response_data = modified_html.encode('utf-8')
                     except Exception as e:
                         print(f"Warning: Could not modify HTML content: {e}")
+                
+                elif 'text/css' in content_type.lower():
+                    try:
+                        css_content = response_data.decode('utf-8', errors='ignore')
+                        modified_css = self.modify_css_for_proxy(css_content, target_url)
+                        response_data = modified_css.encode('utf-8')
+                    except Exception as e:
+                        print(f"Warning: Could not modify CSS content: {e}")
                 
                 # Send the response body
                 self.wfile.write(response_data)
@@ -181,6 +188,23 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                 if header.lower() == 'content-encoding':
                     continue
                 self.send_header(header, response.headers[header])
+        
+        # Ensure proper content type for common file types
+        content_type = response.headers.get('Content-Type', '')
+        if not content_type:
+            # Guess content type from URL
+            if self.path.endswith('.css'):
+                self.send_header('Content-Type', 'text/css')
+            elif self.path.endswith('.js'):
+                self.send_header('Content-Type', 'application/javascript')
+            elif self.path.endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                self.send_header('Content-Type', f'image/{self.path.split(".")[-1]}')
+            elif self.path.endswith('.svg'):
+                self.send_header('Content-Type', 'image/svg+xml')
+            elif self.path.endswith('.woff'):
+                self.send_header('Content-Type', 'font/woff')
+            elif self.path.endswith('.woff2'):
+                self.send_header('Content-Type', 'font/woff2')
     
     def send_cors_headers(self):
         """Send CORS headers to allow browser access"""
@@ -249,6 +273,84 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             print(f"Error modifying HTML: {e}")
             return html_content
+    
+    def modify_css_for_proxy(self, css_content, base_url):
+        """Modify CSS content to work through the proxy"""
+        try:
+            # Get the current host (Render URL or localhost)
+            host = self.headers.get('Host', 'localhost:8080')
+            proxy_base = f"https://{host}" if not host.startswith('http') else host
+            
+            # Parse base URL
+            parsed_base = urlparse(base_url)
+            
+            # Function to replace URLs in CSS
+            def replace_css_url(match):
+                url = match.group(1).strip('\'"')
+                
+                # Skip data URLs and fragments
+                if url.startswith(('data:', '#', 'about:')):
+                    return match.group(0)
+                
+                # Skip empty URLs
+                if not url.strip():
+                    return match.group(0)
+                
+                # Convert relative URL to absolute
+                if not url.startswith(('http://', 'https://')):
+                    if url.startswith('//'):
+                        url = parsed_base.scheme + ':' + url
+                    elif url.startswith('/'):
+                        url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+                    else:
+                        url = urllib.parse.urljoin(base_url, url)
+                
+                # Create proxy URL
+                encoded_url = urllib.parse.quote(url, safe='')
+                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
+                return f'url("{proxy_url}")'
+            
+            # Replace url() functions in CSS
+            css_content = re.sub(
+                r'url\(\s*(["\']?)([^)]+?)\1\s*\)',
+                lambda m: replace_css_url(m) if m.group(2).strip() else m.group(0),
+                css_content,
+                flags=re.IGNORECASE
+            )
+            
+            # Handle @import statements
+            def replace_import_url(match):
+                quote = match.group(1)
+                url = match.group(2)
+                
+                if url.startswith(('data:', '#', 'about:')):
+                    return match.group(0)
+                
+                if not url.startswith(('http://', 'https://')):
+                    if url.startswith('//'):
+                        url = parsed_base.scheme + ':' + url
+                    elif url.startswith('/'):
+                        url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+                    else:
+                        url = urllib.parse.urljoin(base_url, url)
+                
+                encoded_url = urllib.parse.quote(url, safe='')
+                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
+                return f'@import {quote}{proxy_url}{quote}'
+            
+            # Replace @import statements
+            css_content = re.sub(
+                r'@import\s+(["\'])([^"\']+)\1',
+                replace_import_url,
+                css_content,
+                flags=re.IGNORECASE
+            )
+            
+            return css_content
+            
+        except Exception as e:
+            print(f"Error modifying CSS: {e}")
+            return css_content
     
     def is_valid_url(self, url):
         """Check if the URL is valid and allowed"""
