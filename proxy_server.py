@@ -24,22 +24,33 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             parsed_path = urlparse(self.path)
             
-            # Handle malformed URLs that are causing 404s
-            if self.path == '/=' or self.path.endswith('/=') or '?url=' in self.path and self.path.endswith('='):
+            # Handle malformed URLs that are causing 404s - EXPANDED DETECTION
+            malformed_patterns = ['/=', '/?url=', '?url==', '&url==']
+            if any(pattern in self.path for pattern in malformed_patterns) or self.path.endswith('='):
                 print(f"❌ Caught malformed URL request: {self.path}")
                 self.send_error_response(400, "Malformed URL - rejecting request")
                 return
             
-            # Handle relative URLs that might come from JavaScript
-            if not parsed_path.path.startswith('/proxy') and not parsed_path.path.startswith('/health') and parsed_path.path != '/':
+            # Handle relative URLs that might come from JavaScript - IMPROVED
+            if (not parsed_path.path.startswith('/proxy') and 
+                not parsed_path.path.startswith('/health') and 
+                parsed_path.path not in ['/', '']):
+                
                 # This might be a relative URL request from JavaScript
                 # Try to construct a proper proxy URL
                 referer = self.headers.get('Referer', '')
+                print(f"🔄 Handling relative URL: {self.path}")
+                print(f"🔄 Referer: {referer}")
+                
                 if 'proxy?url=' in referer:
                     # Extract the original domain from the referer
                     try:
-                        referer_url = urllib.parse.unquote(referer.split('proxy?url=')[1].split('&')[0])
-                        original_domain = urlparse(referer_url)
+                        # More robust URL extraction
+                        referer_parts = referer.split('proxy?url=')[1].split('&')[0]
+                        original_url = urllib.parse.unquote(referer_parts)
+                        original_domain = urlparse(original_url)
+                        
+                        print(f"🔄 Original domain: {original_domain.netloc}")
                         
                         # Construct the full URL
                         if self.path.startswith('/'):
@@ -47,17 +58,28 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                         else:
                             full_url = f"{original_domain.scheme}://{original_domain.netloc}/{self.path}"
                         
-                        print(f"🔄 Converting relative request '{self.path}' to full URL: {full_url}")
+                        print(f"🔄 Converting '{self.path}' to '{full_url}'")
                         
-                        # Redirect to proper proxy URL
-                        proxy_url = f"/proxy?url={urllib.parse.quote(full_url, safe='')}"
-                        self.send_response(302)
-                        self.send_header('Location', proxy_url)
-                        self.end_headers()
-                        return
-                        
+                        # Validate the constructed URL
+                        if self.is_valid_url(full_url):
+                            # Redirect to proper proxy URL
+                            proxy_url = f"/proxy?url={urllib.parse.quote(full_url, safe='')}"
+                            print(f"🔄 Redirecting to: {proxy_url}")
+                            self.send_response(302)
+                            self.send_header('Location', proxy_url)
+                            self.send_cors_headers()
+                            self.end_headers()
+                            return
+                        else:
+                            print(f"❌ Constructed URL is invalid: {full_url}")
+                            
                     except Exception as e:
                         print(f"❌ Failed to convert relative URL: {e}")
+                
+                # If we can't convert it, reject it to prevent errors
+                print(f"❌ Rejecting unhandleable relative URL: {self.path}")
+                self.send_error_response(404, f"Cannot handle relative URL: {self.path}")
+                return
             
             if parsed_path.path == '/proxy':
                 self.handle_proxy_request(parsed_path)
@@ -256,6 +278,14 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                 if header.lower() == 'content-encoding':
                     continue
                 self.send_header(header, response.headers[header])
+        
+        # Remove frame-busting headers that prevent iframe loading
+        frame_busting_headers = ['X-Frame-Options', 'Content-Security-Policy']
+        for header in frame_busting_headers:
+            if header in response.headers:
+                print(f"🚫 Removing frame-busting header: {header}: {response.headers[header]}")
+                # Don't copy these headers
+                continue
         
         # Ensure proper content type for common file types
         content_type = response.headers.get('Content-Type', '')
