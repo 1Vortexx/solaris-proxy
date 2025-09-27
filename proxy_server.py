@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Solaris Browser Proxy Server - Render Deployment
@@ -167,6 +166,10 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                 if 'text/html' in content_type.lower():
                     try:
                         html_content = response_data.decode('utf-8', errors='ignore')
+                        
+                        # Add debugging to see what's happening
+                        print(f"📄 Processing HTML content, length: {len(html_content)}")
+                        
                         modified_html = self.modify_html_for_proxy(html_content, target_url)
                         
                         # Add a base tag to help with relative URL resolution
@@ -182,18 +185,23 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                                 flags=re.IGNORECASE,
                                 count=1
                             )
+                            print(f"📄 Added base tag: {base_href}")
                         
                         response_data = modified_html.encode('utf-8')
+                        print(f"📄 HTML modification completed")
+                        
                     except Exception as e:
-                        print(f"Warning: Could not modify HTML content: {e}")
+                        print(f"❌ Warning: Could not modify HTML content: {e}")
                 
                 elif 'text/css' in content_type.lower():
                     try:
                         css_content = response_data.decode('utf-8', errors='ignore')
+                        print(f"🎨 Processing CSS file from: {target_url}")
                         modified_css = self.modify_css_for_proxy(css_content, target_url)
                         response_data = modified_css.encode('utf-8')
+                        print(f"🎨 CSS modification completed")
                     except Exception as e:
-                        print(f"Warning: Could not modify CSS content: {e}")
+                        print(f"❌ Warning: Could not modify CSS content: {e}")
                 
                 # Send the response body
                 self.wfile.write(response_data)
@@ -339,21 +347,33 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             # Get the current host (Render URL or localhost)
             host = self.headers.get('Host', 'localhost:8080')
-            proxy_base = f"https://{host}" if not host.startswith('http') else host
+            # FORCE HTTPS for all proxy URLs
+            proxy_base = f"https://{host}"
+            
+            print(f"🎨 Modifying CSS for: {base_url}")
+            print(f"🎨 Using proxy base: {proxy_base}")
             
             # Parse base URL
             parsed_base = urlparse(base_url)
             
+            # Count replacements for debugging
+            replacement_count = 0
+            
             # Function to replace URLs in CSS
             def replace_css_url(match):
-                url = match.group(1).strip('\'"')
+                nonlocal replacement_count
+                url = match.group(2).strip('\'"')
+                
+                print(f"🎨 Processing CSS url(): '{url}'")
                 
                 # Skip data URLs and fragments
                 if url.startswith(('data:', '#', 'about:')):
+                    print(f"🎨   Skipping (special protocol): {url}")
                     return match.group(0)
                 
                 # Skip empty URLs
                 if not url.strip():
+                    print(f"🎨   Skipping (empty): {url}")
                     return match.group(0)
                 
                 # Convert relative URL to absolute
@@ -365,51 +385,37 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         url = urllib.parse.urljoin(base_url, url)
                 
-                # Create proxy URL
+                print(f"🎨   Converted to absolute: {url}")
+                
+                # Create proxy URL with HTTPS
                 encoded_url = urllib.parse.quote(url, safe='')
                 proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
+                replacement_count += 1
+                print(f"🎨   Final proxy URL: {proxy_url}")
                 return f'url("{proxy_url}")'
             
-            # Replace url() functions in CSS
+            # Replace url() functions in CSS with more comprehensive regex
+            original_css = css_content
             css_content = re.sub(
                 r'url\(\s*(["\']?)([^)]+?)\1\s*\)',
-                lambda m: replace_css_url(m) if m.group(2).strip() else m.group(0),
+                replace_css_url,
                 css_content,
                 flags=re.IGNORECASE
             )
             
-            # Handle @import statements
-            def replace_import_url(match):
-                quote = match.group(1)
-                url = match.group(2)
-                
-                if url.startswith(('data:', '#', 'about:')):
-                    return match.group(0)
-                
-                if not url.startswith(('http://', 'https://')):
-                    if url.startswith('//'):
-                        url = parsed_base.scheme + ':' + url
-                    elif url.startswith('/'):
-                        url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
-                    else:
-                        url = urllib.parse.urljoin(base_url, url)
-                
-                encoded_url = urllib.parse.quote(url, safe='')
-                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                return f'@import {quote}{proxy_url}{quote}'
+            print(f"🎨 CSS modification complete. Made {replacement_count} replacements.")
             
-            # Replace @import statements
-            css_content = re.sub(
-                r'@import\s+(["\'])([^"\']+)\1',
-                replace_import_url,
-                css_content,
-                flags=re.IGNORECASE
-            )
+            # If no replacements were made, log the first few lines for debugging
+            if replacement_count == 0:
+                print(f"🎨 WARNING: No CSS URLs were replaced!")
+                print(f"🎨 First 500 chars of CSS: {original_css[:500]}")
             
             return css_content
             
         except Exception as e:
-            print(f"Error modifying CSS: {e}")
+            print(f"❌ Error modifying CSS: {e}")
+            import traceback
+            traceback.print_exc()
             return css_content
     
     def is_valid_url(self, url):
