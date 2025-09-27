@@ -24,6 +24,12 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             parsed_path = urlparse(self.path)
             
+            # Handle malformed URLs that are causing 404s
+            if self.path == '/=' or self.path.endswith('/='):
+                print(f"❌ Caught malformed URL request: {self.path}")
+                self.send_error_response(400, "Malformed URL - rejecting request")
+                return
+            
             if parsed_path.path == '/proxy':
                 self.handle_proxy_request(parsed_path)
             elif parsed_path.path == '/health':
@@ -77,13 +83,22 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         query_params = parse_qs(parsed_path.query)
         
         if 'url' not in query_params:
+            print("❌ Missing 'url' parameter in proxy request")
             self.send_error_response(400, "Missing 'url' parameter")
             return
         
         target_url = query_params['url'][0]
-        print(f"Proxying {method} request to: {target_url}")
+        print(f"🌐 Proxying {method} request to: {target_url}")
+        
+        # Debug: Check for malformed URLs
+        if target_url == '' or target_url == '=':
+            print(f"❌ Malformed URL detected: '{target_url}'")
+            print(f"❌ Full query string: {parsed_path.query}")
+            self.send_error_response(400, f"Malformed URL: '{target_url}'")
+            return
         
         if not self.is_valid_url(target_url):
+            print(f"❌ Invalid URL: {target_url}")
             self.send_error_response(400, "Invalid or blocked URL")
             return
         
