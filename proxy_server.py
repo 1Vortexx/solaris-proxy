@@ -215,25 +215,88 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             # Get response data
             response_data = response.read()
             content_type = response.headers.get('Content-Type', '')
+            content_encoding = response.headers.get('Content-Encoding', '')
             
-            # Handle compressed content
-            if response.headers.get('Content-Encoding') == 'gzip':
-                try:
-                    response_data = gzip.decompress(response_data)
-                except Exception as e:
-                    logger.warning(f"Failed to decompress gzip content: {e}")
+            # Handle compressed content properly
+            if content_encoding:
+                logger.info(f"Decompressing content with encoding: {content_encoding}")
+                if content_encoding.lower() == 'gzip':
+                    try:
+                        response_data = gzip.decompress(response_data)
+                        logger.info("Successfully decompressed gzip content")
+                    except Exception as e:
+                        logger.error(f"Failed to decompress gzip content: {e}")
+                elif content_encoding.lower() == 'deflate':
+                    try:
+                        import zlib
+                        response_data = zlib.decompress(response_data)
+                        logger.info("Successfully decompressed deflate content")
+                    except Exception as e:
+                        logger.error(f"Failed to decompress deflate content: {e}")
+                elif content_encoding.lower() == 'br':
+                    try:
+                        import brotli
+                        response_data = brotli.decompress(response_data)
+                        logger.info("Successfully decompressed brotli content")
+                    except ImportError:
+                        logger.warning("Brotli compression detected but brotli module not available")
+                    except Exception as e:
+                        logger.error(f"Failed to decompress brotli content: {e}")
             
-            # Send response headers
+            # Send response headers first
             self.send_response(response.getcode())
             self._copy_response_headers(response)
             self.send_cors_headers()
-            self.end_headers()
             
-            # Modify content based on type
-            if 'text/html' in content_type.lower():
-                response_data = self._modify_html_content(response_data, target_url)
-            elif 'text/css' in content_type.lower():
-                response_data = self._modify_css_content(response_data, target_url)
+            # Determine if content should be modified
+            should_modify = False
+            if content_type:
+                if ('text/html' in content_type.lower() or 
+                    'text/css' in content_type.lower() or
+                    'application/javascript' in content_type.lower() or
+                    'text/javascript' in content_type.lower()):
+                    should_modify = True
+            
+            # Only try to decode and modify text content
+            if should_modify:
+                try:
+                    # Try to decode as text
+                    if isinstance(response_data, bytes):
+                        # Try different encodings
+                        for encoding in ['utf-8', 'iso-8859-1', 'windows-1252']:
+                            try:
+                                text_content = response_data.decode(encoding)
+                                logger.info(f"Successfully decoded content with {encoding}")
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        else:
+                            # If all encodings fail, use utf-8 with error handling
+                            text_content = response_data.decode('utf-8', errors='replace')
+                            logger.warning("Used utf-8 with error replacement for decoding")
+                    else:
+                        text_content = response_data
+                    
+                    # Modify content based on type
+                    if 'text/html' in content_type.lower():
+                        modified_content = self._modify_html_for_proxy(text_content, target_url)
+                        response_data = modified_content.encode('utf-8')
+                        # Update content type to ensure UTF-8
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    elif 'text/css' in content_type.lower():
+                        modified_content = self._modify_css_for_proxy(text_content, target_url)
+                        response_data = modified_content.encode('utf-8')
+                        self.send_header('Content-Type', 'text/css; charset=utf-8')
+                    
+                    logger.info(f"Content modification completed for {content_type}")
+                    
+                except Exception as e:
+                    logger.error(f"Error modifying content: {e}")
+                    # If modification fails, send original data
+            
+            # Set correct content length
+            self.send_header('Content-Length', str(len(response_data)))
+            self.end_headers()
             
             # Send the response body
             self.wfile.write(response_data)
@@ -243,10 +306,9 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             logger.error(f"Error processing response: {e}")
             raise
     
-    def _modify_html_content(self, response_data, target_url):
-        """Modify HTML content for proxy compatibility"""
+    def _modify_html_for_proxy(self, html_content, base_url):
+        """Modify HTML content to work through the proxy"""
         try:
-            html_content = response_data.decode('utf-8', errors='ignore')
             logger.info(f"Processing HTML content, length: {len(html_content)}")
             
             # Get proxy base URL
@@ -255,7 +317,7 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
             
             # Parse base URL
-            parsed_base = urlparse(target_url)
+            parsed_base = urlparse(base_url)
             base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
             
             # Function to replace URLs
@@ -270,7 +332,7 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                 
                 # Convert relative URL to absolute
                 if not url.startswith(('http://', 'https://')):
-                    url = urllib.parse.urljoin(target_url, url)
+                    url = urllib.parse.urljoin(base_url, url)
                 
                 # Create proxy URL
                 encoded_url = urllib.parse.quote(url, safe='')
@@ -286,7 +348,7 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             def replace_css_url(match):
                 url = match.group(1).strip('\'"')
                 if not url.startswith(('http://', 'https://', 'data:', '#', 'blob:')):
-                    url = urllib.parse.urljoin(target_url, url)
+                    url = urllib.parse.urljoin(base_url, url)
                     encoded_url = urllib.parse.quote(url, safe='')
                     proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
                     return f'url("{proxy_url}")'
@@ -305,22 +367,20 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                     count=1
                 )
             
-            return html_content.encode('utf-8')
+            return html_content
             
         except Exception as e:
             logger.error(f"Error modifying HTML content: {e}")
-            return response_data
+            return html_content
     
-    def _modify_css_content(self, response_data, target_url):
+    def _modify_css_for_proxy(self, css_content, base_url):
         """Modify CSS content for proxy compatibility"""
         try:
-            css_content = response_data.decode('utf-8', errors='ignore')
-            
             # Get proxy base URL
             host = self.headers.get('Host', 'localhost:8080')
             proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
             
-            parsed_base = urlparse(target_url)
+            parsed_base = urlparse(base_url)
             replacement_count = 0
             
             def replace_css_url(match):
@@ -338,7 +398,7 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
                     elif url.startswith('/'):
                         url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
                     else:
-                        url = urllib.parse.urljoin(target_url, url)
+                        url = urllib.parse.urljoin(base_url, url)
                 
                 # Create proxy URL
                 encoded_url = urllib.parse.quote(url, safe='')
@@ -355,11 +415,11 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             )
             
             logger.info(f"CSS modification complete. Made {replacement_count} replacements.")
-            return css_content.encode('utf-8')
+            return css_content
             
         except Exception as e:
             logger.error(f"Error modifying CSS content: {e}")
-            return response_data
+            return css_content
     
     def _set_request_headers(self, request):
         """Set appropriate headers for the proxied request"""
