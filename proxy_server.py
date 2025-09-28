@@ -1,945 +1,390 @@
-#!/usr/bin/env python3
-"""
-Solaris Browser Proxy Server - Render Deployment (Clean Version)
-A robust HTTP proxy server designed specifically for the Solaris web browser
-Optimized for Render.com deployment with enhanced error handling and security
-"""
-
-import http.server
-import socketserver
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
-import re
+import asyncio
+import aiohttp
 import gzip
-import os
-import ssl
-import socket
-import threading
+import hashlib
 import time
-from urllib.parse import urlparse, parse_qs
-from io import BytesIO
+from urllib.parse import urljoin, urlparse, parse_qs
+from aiohttp import web, ClientTimeout
+from aiohttp.web_middlewares import normalize_path_middleware
 import logging
+import os
+from typing import Optional, Dict, Any
+import weakref
 
-# Configure logging for Render
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
+class MemoryCache:
+    """Simple in-memory cache with TTL and size limits"""
+    def __init__(self, max_size: int = 1000, default_ttl: int = 300):
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.max_size = max_size
+        self.default_ttl = default_ttl
+        self.access_times: Dict[str, float] = {}
     
-    def __init__(self, *args, **kwargs):
-        # Set timeout for requests
-        self.timeout = 30
-        super().__init__(*args, **kwargs)
+    def _cleanup_expired(self):
+        current_time = time.time()
+        expired_keys = []
+        for key, data in self.cache.items():
+            if current_time > data['expires_at']:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            self.cache.pop(key, None)
+            self.access_times.pop(key, None)
     
-    def do_GET(self):
-        """Handle GET requests with improved error handling"""
-        try:
-            parsed_path = urlparse(self.path)
-            
-            # Enhanced malformed URL detection - catch more patterns
-            malformed_patterns = [
-                '/=', '/?url=', '?url==', '&url==', 'url===', 
-                '/proxy?url=https%3A//twitter.com/=', 
-                '/proxy?url=https%3A//google.com/='
-            ]
-            
-            # Check for malformed URLs more thoroughly
-            is_malformed = (
-                any(pattern in self.path for pattern in malformed_patterns) or 
-                self.path.endswith('=') or 
-                '==' in self.path or
-                '/=' in self.path or
-                re.search(r'url=[^&]*=$', self.path)  # URL parameter ending with just =
-            )
-            
-            if is_malformed:
-                logger.warning(f"Malformed URL request blocked: {self.path}")
-                self.send_error_response(400, "Malformed URL - request rejected")
-                return
-            
-            # Handle relative URLs with better logic
-            if (not parsed_path.path.startswith('/proxy') and 
-                not parsed_path.path.startswith('/health') and 
-                parsed_path.path not in ['/', '']):
-                
-                self._handle_relative_url(parsed_path)
-                return
-            
-            # Route requests
-            if parsed_path.path == '/proxy':
-                self.handle_proxy_request(parsed_path)
-            elif parsed_path.path == '/health':
-                self.handle_health_check()
-            elif parsed_path.path == '/' or parsed_path.path == '':
-                self.serve_status_page()
+    def _evict_lru(self):
+        """Evict least recently used items if cache is full"""
+        if len(self.cache) >= self.max_size:
+            # Sort by access time and remove oldest
+            sorted_keys = sorted(self.access_times.items(), key=lambda x: x[1])
+            keys_to_remove = [k for k, _ in sorted_keys[:len(self.cache) - self.max_size + 10]]
+            for key in keys_to_remove:
+                self.cache.pop(key, None)
+                self.access_times.pop(key, None)
+    
+    def get(self, key: str) -> Optional[bytes]:
+        self._cleanup_expired()
+        current_time = time.time()
+        
+        if key in self.cache:
+            data = self.cache[key]
+            if current_time <= data['expires_at']:
+                self.access_times[key] = current_time
+                return data['content']
             else:
-                self.send_error_response(404, "Endpoint not found")
-                
-        except Exception as e:
-            logger.error(f"Error in GET request: {str(e)}")
-            self.send_error_response(500, "Internal server error")
-        
-    def do_POST(self):
-        """Handle POST requests through proxy"""
-        try:
-            parsed_path = urlparse(self.path)
-            if parsed_path.path == '/proxy':
-                self.handle_proxy_request(parsed_path, method='POST')
-            else:
-                self.send_error_response(404, "Endpoint not found")
-        except Exception as e:
-            logger.error(f"Error in POST request: {str(e)}")
-            self.send_error_response(500, "Internal server error")
+                self.cache.pop(key, None)
+                self.access_times.pop(key, None)
+        return None
     
-    def do_OPTIONS(self):
-        """Handle OPTIONS requests for CORS preflight"""
-        self.send_response(200)
-        self.send_cors_headers()
-        self.end_headers()
+    def set(self, key: str, content: bytes, ttl: Optional[int] = None):
+        self._cleanup_expired()
+        self._evict_lru()
+        
+        ttl = ttl or self.default_ttl
+        current_time = time.time()
+        
+        self.cache[key] = {
+            'content': content,
+            'expires_at': current_time + ttl,
+            'created_at': current_time
+        }
+        self.access_times[key] = current_time
     
-    def _handle_relative_url(self, parsed_path):
-        """Handle relative URL requests with improved conversion logic"""
-        referer = self.headers.get('Referer', '')
-        logger.info(f"Handling relative URL: {self.path} with referer: {referer}")
+    def clear(self):
+        self.cache.clear()
+        self.access_times.clear()
+
+class WebProxy:
+    def __init__(self):
+        self.cache = MemoryCache(max_size=500, default_ttl=300)  # 5 min default TTL
+        self.session: Optional[aiohttp.ClientSession] = None
         
-        if 'proxy?url=' in referer:
-            try:
-                # Extract the original URL from referer
-                referer_parts = referer.split('proxy?url=')[1].split('&')[0]
-                original_url = urllib.parse.unquote(referer_parts)
-                original_domain = urlparse(original_url)
-                
-                # Construct the full URL
-                if self.path.startswith('/'):
-                    full_url = f"{original_domain.scheme}://{original_domain.netloc}{self.path}"
-                else:
-                    full_url = f"{original_domain.scheme}://{original_domain.netloc}/{self.path}"
-                
-                logger.info(f"Converting relative URL '{self.path}' to '{full_url}'")
-                
-                if self.is_valid_url(full_url):
-                    # Redirect to proper proxy URL
-                    proxy_url = f"/proxy?url={urllib.parse.quote(full_url, safe='')}"
-                    self.send_response(302)
-                    self.send_header('Location', proxy_url)
-                    self.send_cors_headers()
-                    self.end_headers()
-                    return
-                    
-            except Exception as e:
-                logger.error(f"Failed to convert relative URL: {e}")
+        # Timeout configuration
+        self.timeout = ClientTimeout(
+            total=30,  # Total timeout
+            connect=10,  # Connection timeout
+            sock_read=20  # Socket read timeout
+        )
         
-        # If conversion fails, reject the request
-        logger.warning(f"Rejecting unhandleable relative URL: {self.path}")
-        self.send_error_response(404, "Cannot resolve relative URL")
-    
-    def handle_health_check(self):
-        """Enhanced health check with system info"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_cors_headers()
-        self.end_headers()
-        
-        health_data = {
-            'status': 'healthy',
-            'service': 'Solaris Browser Proxy',
-            'version': '2.0.0',
-            'environment': 'render' if 'RENDER' in os.environ else 'local',
-            'timestamp': time.time(),
-            'uptime': time.time() - getattr(self.server, 'start_time', time.time()),
-            'python_version': f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
+        # Headers to forward from client to target
+        self.forward_headers = {
+            'user-agent', 'accept', 'accept-language', 'accept-encoding',
+            'cache-control', 'referer', 'origin'
         }
         
-        self.wfile.write(json.dumps(health_data, indent=2).encode())
-        logger.info("Health check requested")
+        # Headers to exclude from response
+        self.exclude_response_headers = {
+            'connection', 'transfer-encoding', 'content-encoding',
+            'content-length', 'server', 'date'
+        }
     
-    def handle_proxy_request(self, parsed_path, method='GET'):
-        """Enhanced proxy request handling with better error management"""
-        query_params = parse_qs(parsed_path.query)
-        
-        if 'url' not in query_params:
-            logger.error("Missing 'url' parameter in proxy request")
-            self.send_error_response(400, "Missing 'url' parameter")
-            return
-        
-        target_url = query_params['url'][0]
-        
-        # Enhanced URL validation and cleaning
-        if not target_url or target_url in ['', '=', '==']:
-            logger.error(f"Empty or invalid URL detected: '{target_url}'")
-            self.send_error_response(400, "Invalid URL provided")
-            return
-        
-        # Clean up common malformed URL patterns
-        if target_url.endswith('/='):
-            target_url = target_url[:-2]  # Remove trailing /=
-            logger.info(f"Cleaned malformed URL, removed '/=': {target_url}")
-        
-        if target_url.endswith('=') and '=' not in target_url[:-1]:
-            target_url = target_url[:-1]  # Remove trailing =
-            logger.info(f"Cleaned malformed URL, removed trailing '=': {target_url}")
-        
-        # Additional validation after cleaning
-        if not target_url or not self.is_valid_url(target_url):
-            logger.error(f"URL validation failed after cleaning: {target_url}")
-            self.send_error_response(400, "Invalid or blocked URL")
-            return
-        
-        logger.info(f"Proxying {method} request to: {target_url}")
-        
-        try:
-            # Create SSL context for HTTPS requests
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Create the request
-            if method == 'POST':
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length) if content_length > 0 else None
-                request = urllib.request.Request(target_url, data=post_data, method='POST')
-            else:
-                request = urllib.request.Request(target_url)
-            
-            # Set headers for the request
-            self._set_request_headers(request)
-            
-            # Create opener with SSL context
-            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_context))
-            
-            # Make the request with timeout
-            response = opener.open(request, timeout=self.timeout)
-            
-            with response:
-                self._process_response(response, target_url)
-                
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP Error for {target_url}: {e.code} {e.reason}")
-            self.send_error_response(e.code, f"HTTP {e.code}: {e.reason}")
-        except urllib.error.URLError as e:
-            logger.error(f"URL Error for {target_url}: {str(e.reason)}")
-            self.send_error_response(502, "Connection failed")
-        except socket.timeout:
-            logger.error(f"Timeout for {target_url}")
-            self.send_error_response(504, "Request timeout")
-        except Exception as e:
-            logger.error(f"Proxy error for {target_url}: {str(e)}")
-            self.send_error_response(500, "Proxy error occurred")
-    
-    def _process_response(self, response, target_url):
-        """Process and modify the response content"""
-        try:
-            # Get response data
-            response_data = response.read()
-            content_type = response.headers.get('Content-Type', '')
-            content_encoding = response.headers.get('Content-Encoding', '')
-            
-            # Handle compressed content properly
-            if content_encoding:
-                logger.info(f"Decompressing content with encoding: {content_encoding}")
-                if content_encoding.lower() == 'gzip':
-                    try:
-                        response_data = gzip.decompress(response_data)
-                        logger.info("Successfully decompressed gzip content")
-                    except Exception as e:
-                        logger.error(f"Failed to decompress gzip content: {e}")
-                elif content_encoding.lower() == 'deflate':
-                    try:
-                        import zlib
-                        response_data = zlib.decompress(response_data)
-                        logger.info("Successfully decompressed deflate content")
-                    except Exception as e:
-                        logger.error(f"Failed to decompress deflate content: {e}")
-                elif content_encoding.lower() == 'br':
-                    try:
-                        import brotli
-                        response_data = brotli.decompress(response_data)
-                        logger.info("Successfully decompressed brotli content")
-                    except ImportError:
-                        logger.warning("Brotli compression detected but brotli module not available")
-                    except Exception as e:
-                        logger.error(f"Failed to decompress brotli content: {e}")
-            
-            # Send response headers first
-            self.send_response(response.getcode())
-            self._copy_response_headers(response)
-            self.send_cors_headers()
-            
-            # Determine if content should be modified
-            should_modify = False
-            if content_type:
-                if ('text/html' in content_type.lower() or 
-                    'text/css' in content_type.lower() or
-                    'application/javascript' in content_type.lower() or
-                    'text/javascript' in content_type.lower()):
-                    should_modify = True
-            
-            # Only try to decode and modify text content
-            if should_modify:
-                try:
-                    # Try to decode as text
-                    if isinstance(response_data, bytes):
-                        # Try different encodings
-                        for encoding in ['utf-8', 'iso-8859-1', 'windows-1252']:
-                            try:
-                                text_content = response_data.decode(encoding)
-                                logger.info(f"Successfully decoded content with {encoding}")
-                                break
-                            except UnicodeDecodeError:
-                                continue
-                        else:
-                            # If all encodings fail, use utf-8 with error handling
-                            text_content = response_data.decode('utf-8', errors='replace')
-                            logger.warning("Used utf-8 with error replacement for decoding")
-                    else:
-                        text_content = response_data
-                    
-                    # Modify content based on type
-                    if 'text/html' in content_type.lower():
-                        modified_content = self._modify_html_for_proxy(text_content, target_url)
-                        response_data = modified_content.encode('utf-8')
-                        # Update content type to ensure UTF-8
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                    elif 'text/css' in content_type.lower():
-                        modified_content = self._modify_css_for_proxy(text_content, target_url)
-                        response_data = modified_content.encode('utf-8')
-                        self.send_header('Content-Type', 'text/css; charset=utf-8')
-                    
-                    logger.info(f"Content modification completed for {content_type}")
-                    
-                except Exception as e:
-                    logger.error(f"Error modifying content: {e}")
-                    # If modification fails, send original data
-            
-            # Set correct content length
-            self.send_header('Content-Length', str(len(response_data)))
-            self.end_headers()
-            
-            # Send the response body
-            self.wfile.write(response_data)
-            logger.info(f"Successfully proxied: {target_url}")
-            
-        except Exception as e:
-            logger.error(f"Error processing response: {e}")
-            raise
-    
-    def _modify_html_for_proxy(self, html_content, base_url):
-        """Modify HTML content to work through the proxy"""
-        try:
-            logger.info(f"Processing HTML content, length: {len(html_content)}")
-            
-            # Get proxy base URL
-            host = self.headers.get('Host', 'localhost:8080')
-            # Use HTTPS for Render deployment
-            proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
-            
-            # Parse base URL
-            parsed_base = urlparse(base_url)
-            base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
-            
-            # Function to replace URLs with better validation
-            def replace_url(match):
-                attr = match.group(1)
-                url = match.group(2)
-                
-                # Skip certain URL types and malformed URLs
-                skip_prefixes = ['javascript:', 'mailto:', 'tel:', 'data:', '#', 'about:', 'blob:', 'chrome:', 'moz-extension:']
-                if any(url.lower().startswith(prefix) for prefix in skip_prefixes):
-                    return match.group(0)
-                
-                # Skip empty URLs or just whitespace
-                if not url.strip():
-                    return match.group(0)
-                
-                # Skip URLs that end with just '=' (malformed)
-                if url.strip() == '=' or url.endswith('/='):
-                    logger.warning(f"Skipping malformed URL: {url}")
-                    return match.group(0)
-                
-                # Clean up the URL
-                url = url.strip()
-                
-                # Convert relative URL to absolute
-                if not url.startswith(('http://', 'https://')):
-                    try:
-                        url = urllib.parse.urljoin(base_url, url)
-                    except Exception as e:
-                        logger.warning(f"Failed to join URL {url}: {e}")
-                        return match.group(0)
-                
-                # Validate the resulting URL
-                if not self.is_valid_url(url):
-                    logger.warning(f"Invalid URL after processing: {url}")
-                    return match.group(0)
-                
-                # Create proxy URL
-                try:
-                    encoded_url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')
-                    proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                    return f'{attr}="{proxy_url}"'
-                except Exception as e:
-                    logger.warning(f"Failed to encode URL {url}: {e}")
-                    return match.group(0)
-            
-            # Replace URLs in various attributes with stricter pattern
-            url_attributes = ['href', 'src', 'action', 'data-src', 'data-url', 'data-href']
-            pattern = f'((?:{"|".join(url_attributes)})\\s*=\\s*["\'])([^"\'\\s>]+)(["\'])'
-            html_content = re.sub(pattern, replace_url, html_content, flags=re.IGNORECASE)
-            
-            # Handle CSS url() functions with better validation
-            def replace_css_url(match):
-                url = match.group(1).strip('\'"')
-                
-                # Skip problematic URLs
-                if (not url.strip() or 
-                    url.startswith(('data:', '#', 'blob:', 'javascript:')) or
-                    url.strip() == '=' or 
-                    url.endswith('/=')):
-                    return match.group(0)
-                
-                try:
-                    if not url.startswith(('http://', 'https://')):
-                        url = urllib.parse.urljoin(base_url, url)
-                    
-                    if self.is_valid_url(url):
-                        encoded_url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')
-                        proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                        return f'url("{proxy_url}")'
-                except Exception as e:
-                    logger.warning(f"Failed to process CSS URL {url}: {e}")
-                
-                return match.group(0)
-            
-            html_content = re.sub(r'url\(\s*([^)]+)\s*\)', replace_css_url, html_content, flags=re.IGNORECASE)
-            
-            # Add JavaScript to handle dynamic URL requests and prevent CORS issues
-            js_injection = f'''
-<script>
-(function() {{
-    'use strict';
-    
-    // Override XMLHttpRequest to proxy requests
-    const originalXHR = window.XMLHttpRequest;
-    function ProxiedXMLHttpRequest() {{
-        const xhr = new originalXHR();
-        const originalOpen = xhr.open;
-        
-        xhr.open = function(method, url, async, user, password) {{
-            // Only proxy absolute URLs
-            if (url && (url.startsWith('http://') || url.startsWith('https://'))) {{
-                const proxyUrl = "{proxy_base}/proxy?url=" + encodeURIComponent(url);
-                return originalOpen.call(this, method, proxyUrl, async, user, password);
-            }}
-            return originalOpen.call(this, method, url, async, user, password);
-        }};
-        
-        return xhr;
-    }}
-    
-    // Copy properties from original constructor
-    Object.setPrototypeOf(ProxiedXMLHttpRequest.prototype, originalXHR.prototype);
-    Object.setPrototypeOf(ProxiedXMLHttpRequest, originalXHR);
-    Object.defineProperty(window, 'XMLHttpRequest', {{
-        value: ProxiedXMLHttpRequest,
-        writable: true,
-        configurable: true
-    }});
-    
-    // Override fetch API
-    const originalFetch = window.fetch;
-    window.fetch = function(resource, options) {{
-        if (typeof resource === 'string' && (resource.startsWith('http://') || resource.startsWith('https://'))) {{
-            const proxyUrl = "{proxy_base}/proxy?url=" + encodeURIComponent(resource);
-            return originalFetch(proxyUrl, options);
-        }}
-        return originalFetch(resource, options);
-    }};
-    
-    console.log('Solaris proxy scripts injected');
-}})();
-</script>
-'''
-            
-            # Add base tag and JavaScript injection
-            if '<head>' in html_content.lower():
-                base_tag = f'<base href="{base_domain}/">'
-                injection = f'\n{base_tag}\n{js_injection}'
-                html_content = re.sub(
-                    r'(<head[^>]*>)',
-                    f'\\1{injection}',
-                    html_content,
-                    flags=re.IGNORECASE,
-                    count=1
-                )
-            elif '<html>' in html_content.lower():
-                # If no head tag, add after html tag
-                html_content = re.sub(
-                    r'(<html[^>]*>)',
-                    f'\\1\n<head>{js_injection}</head>',
-                    html_content,
-                    flags=re.IGNORECASE,
-                    count=1
-                )
-            
-            return html_content
-            
-        except Exception as e:
-            logger.error(f"Error modifying HTML content: {e}")
-            return html_content
-    
-    def _modify_css_for_proxy(self, css_content, base_url):
-        """Modify CSS content for proxy compatibility"""
-        try:
-            # Get proxy base URL
-            host = self.headers.get('Host', 'localhost:8080')
-            proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
-            
-            parsed_base = urlparse(base_url)
-            replacement_count = 0
-            
-            def replace_css_url(match):
-                nonlocal replacement_count
-                url = match.group(2).strip('\'"')
-                
-                # Skip data URLs, fragments, and empty URLs
-                if url.startswith(('data:', '#', 'about:', 'blob:')) or not url.strip():
-                    return match.group(0)
-                
-                # Convert relative URL to absolute
-                if not url.startswith(('http://', 'https://')):
-                    if url.startswith('//'):
-                        url = parsed_base.scheme + ':' + url
-                    elif url.startswith('/'):
-                        url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
-                    else:
-                        url = urllib.parse.urljoin(base_url, url)
-                
-                # Create proxy URL
-                encoded_url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')
-                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                replacement_count += 1
-                return f'url("{proxy_url}")'
-            
-            # Replace url() functions in CSS
-            css_content = re.sub(
-                r'url\(\s*(["\']?)([^)]+?)\1\s*\)',
-                replace_css_url,
-                css_content,
-                flags=re.IGNORECASE
+    async def init_session(self):
+        """Initialize aiohttp session with optimizations"""
+        if not self.session:
+            connector = aiohttp.TCPConnector(
+                limit=100,  # Total connection pool size
+                limit_per_host=10,  # Connections per host
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
             )
             
-            logger.info(f"CSS modification complete. Made {replacement_count} replacements.")
-            return css_content
-            
-        except Exception as e:
-            logger.error(f"Error modifying CSS content: {e}")
-            return css_content
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=self.timeout,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            )
     
-    def _set_request_headers(self, request):
-        """Set appropriate headers for the proxied request"""
-        # Set a realistic User-Agent
-        user_agent = self.headers.get('User-Agent', 
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        request.add_header('User-Agent', user_agent)
-        
-        # Copy important headers
-        headers_to_copy = [
-            'Accept', 'Accept-Language', 'Accept-Encoding',
-            'Cookie', 'Authorization', 'Content-Type'
-        ]
-        
-        for header in headers_to_copy:
-            if header in self.headers:
-                request.add_header(header, self.headers[header])
-        
-        # Add compression support
-        request.add_header('Accept-Encoding', 'gzip, deflate, br')
-        
-        # Add security headers
-        request.add_header('DNT', '1')
-        request.add_header('Sec-Fetch-Mode', 'navigate')
-        request.add_header('Sec-Fetch-Site', 'cross-site')
+    async def close_session(self):
+        """Clean up session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
     
-    def _copy_response_headers(self, response):
-        """Copy relevant headers from the response"""
-        headers_to_copy = [
-            'Content-Type', 'Set-Cookie', 'Cache-Control', 
-            'Expires', 'Last-Modified', 'ETag', 'Location'
-        ]
+    def _get_cache_key(self, url: str, method: str, headers: dict) -> str:
+        """Generate cache key for request"""
+        # Include method, url, and relevant headers in cache key
+        key_data = f"{method}:{url}"
         
-        for header in headers_to_copy:
-            if header in response.headers:
-                # Skip headers that might cause issues
-                if header.lower() in ['content-length', 'content-encoding', 'transfer-encoding']:
-                    continue
-                self.send_header(header, response.headers[header])
+        # Add cache-affecting headers
+        cache_headers = []
+        for header in ['accept', 'accept-language', 'user-agent']:
+            if header in headers:
+                cache_headers.append(f"{header}:{headers[header]}")
         
-        # Remove frame-busting headers
-        frame_busting_headers = ['X-Frame-Options', 'Content-Security-Policy']
-        for header in frame_busting_headers:
-            if header in response.headers:
-                logger.info(f"Removing frame-busting header: {header}")
+        if cache_headers:
+            key_data += ":" + "|".join(cache_headers)
+        
+        return hashlib.md5(key_data.encode()).hexdigest()
     
-    def send_cors_headers(self):
-        """Send comprehensive CORS headers"""
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
-        self.send_header('Access-Control-Expose-Headers', 'Content-Length, Content-Type')
-        self.send_header('Access-Control-Max-Age', '86400')
-    
-    def is_valid_url(self, url):
-        """Enhanced URL validation with security checks"""
-        try:
-            parsed = urlparse(url)
-            
-            # Only allow HTTP and HTTPS
-            if parsed.scheme not in ['http', 'https']:
-                return False
-            
-            # Must have a netloc (domain)
-            if not parsed.netloc:
-                return False
-            
-            # Enhanced security: block private networks and localhost
-            blocked_patterns = [
-                'localhost', '127.0.0.1', '0.0.0.0', '[::]',
-                '192.168.', '10.', '172.16.', '172.17.', '172.18.',
-                '172.19.', '172.20.', '172.21.', '172.22.', '172.23.',
-                '172.24.', '172.25.', '172.26.', '172.27.', '172.28.',
-                '172.29.', '172.30.', '172.31.', 'metadata.google.internal',
-                '169.254.', 'link-local'
-            ]
-            
-            domain_lower = parsed.netloc.lower()
-            for blocked in blocked_patterns:
-                if blocked in domain_lower:
-                    logger.warning(f"Blocked potentially dangerous URL: {url}")
-                    return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"URL validation error: {e}")
+    def _should_cache(self, method: str, status: int, headers: dict) -> bool:
+        """Determine if response should be cached"""
+        if method != 'GET':
             return False
+        
+        if status not in (200, 301, 302, 304, 404):
+            return False
+        
+        # Check cache-control headers
+        cache_control = headers.get('cache-control', '').lower()
+        if 'no-cache' in cache_control or 'no-store' in cache_control:
+            return False
+        
+        return True
     
-    def serve_status_page(self):
-        """Serve an enhanced status page"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_cors_headers()
-        self.end_headers()
+    def _get_ttl_from_headers(self, headers: dict) -> int:
+        """Extract TTL from response headers"""
+        cache_control = headers.get('cache-control', '')
         
-        # Get the current host for display
-        host = self.headers.get('Host', 'localhost:8080')
-        is_render = 'RENDER' in os.environ
-        protocol = 'https' if is_render else 'http'
+        # Look for max-age directive
+        for directive in cache_control.split(','):
+            directive = directive.strip().lower()
+            if directive.startswith('max-age='):
+                try:
+                    return int(directive.split('=')[1])
+                except (ValueError, IndexError):
+                    pass
         
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solaris Browser Proxy - Enhanced</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-            color: white;
-        }}
-        .container {{
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(15px);
-            border-radius: 24px;
-            padding: 40px;
-            max-width: 700px;
-            width: 100%;
-            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.25);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }}
-        h1 {{
-            font-size: 2.8em;
-            margin-bottom: 10px;
-            text-align: center;
-            background: linear-gradient(135deg, #fff 0%, #e0e6ff 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }}
-        .subtitle {{
-            text-align: center;
-            opacity: 0.8;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }}
-        .status {{
-            background: rgba(76, 175, 80, 0.2);
-            border: 2px solid rgba(76, 175, 80, 0.5);
-            padding: 25px;
-            border-radius: 16px;
-            margin: 25px 0;
-            text-align: center;
-        }}
-        .status h2 {{
-            margin-bottom: 10px;
-            font-size: 1.5em;
-        }}
-        .endpoint {{
-            background: rgba(255, 255, 255, 0.1);
-            padding: 20px;
-            border-radius: 12px;
-            margin: 20px 0;
-            font-family: 'Courier New', monospace;
-            word-break: break-all;
-            font-size: 13px;
-            border-left: 4px solid rgba(255, 255, 255, 0.3);
-        }}
-        .endpoint strong {{
-            display: block;
-            margin-bottom: 8px;
-            font-family: 'Segoe UI', sans-serif;
-            color: rgba(255, 255, 255, 0.9);
-        }}
-        .grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-top: 30px;
-        }}
-        .card {{
-            background: rgba(255, 255, 255, 0.1);
-            padding: 20px;
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }}
-        .card h3 {{
-            margin-bottom: 15px;
-            color: rgba(255, 255, 255, 0.9);
-            font-size: 1.1em;
-        }}
-        .card ul, .card ol {{
-            line-height: 1.6;
-            padding-left: 20px;
-        }}
-        .card li {{
-            margin-bottom: 8px;
-            color: rgba(255, 255, 255, 0.8);
-            font-size: 0.9em;
-        }}
-        .badge {{
-            display: inline-block;
-            background: rgba(255, 255, 255, 0.2);
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.8em;
-            margin: 5px 5px 0 0;
-        }}
-        @media (max-width: 768px) {{
-            .grid {{ grid-template-columns: 1fr; }}
-            .container {{ padding: 30px 20px; }}
-            h1 {{ font-size: 2.2em; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🚀 Solaris Browser Proxy</h1>
-        <div class="subtitle">Enhanced Security & Performance</div>
+        # Default TTL based on content type
+        content_type = headers.get('content-type', '').lower()
+        if any(ct in content_type for ct in ['image/', 'font/', 'css', 'javascript']):
+            return 3600  # 1 hour for static assets
+        elif 'text/html' in content_type:
+            return 300   # 5 minutes for HTML
         
-        <div class="status">
-            <h2>✅ Server Online & Ready</h2>
-            <p>Proxy server is active and optimized for {'Render.com' if is_render else 'local development'}</p>
-            <div style="margin-top: 15px;">
-                <span class="badge">Version 2.0.0</span>
-                <span class="badge">{'Production' if is_render else 'Development'}</span>
-                <span class="badge">SSL Ready</span>
-            </div>
-        </div>
-        
-        <div style="margin: 30px 0;">
-            <h3 style="margin-bottom: 20px; text-align: center;">📡 API Endpoints</h3>
-            <div class="endpoint">
-                <strong>🌐 Web Proxy:</strong>
-                {protocol}://{host}/proxy?url=TARGET_URL
-            </div>
-            <div class="endpoint">
-                <strong>❤️ Health Check:</strong>
-                {protocol}://{host}/health
-            </div>
-        </div>
-        
-        <div class="grid">
-            <div class="card">
-                <h3>🚀 Quick Start</h3>
-                <ol>
-                    <li>Open your Solaris Browser client</li>
-                    <li>Set proxy URL to: <code>{host}</code></li>
-                    <li>Enter any website URL</li>
-                    <li>Browse with enhanced privacy</li>
-                </ol>
-            </div>
-            
-            <div class="card">
-                <h3>⚡ Enhanced Features</h3>
-                <ul>
-                    <li>Advanced CORS handling</li>
-                    <li>Smart content modification</li>
-                    <li>SSL/TLS support</li>
-                    <li>Gzip compression handling</li>
-                    <li>Security filtering</li>
-                    <li>Performance optimizations</li>
-                </ul>
-            </div>
-            
-            <div class="card">
-                <h3>🔒 Security</h3>
-                <ul>
-                    <li>Private network blocking</li>
-                    <li>Malformed URL detection</li>
-                    <li>Request sanitization</li>
-                    <li>Frame-busting removal</li>
-                    <li>Timeout protection</li>
-                </ul>
-            </div>
-            
-            <div class="card">
-                <h3>📊 Monitoring</h3>
-                <ul>
-                    <li>Health check endpoint</li>
-                    <li>Detailed error logging</li>
-                    <li>Performance metrics</li>
-                    <li>Request tracking</li>
-                    <li>System information</li>
-                </ul>
-            </div>
-        </div>
-    </div>
-</body>
-</html>"""
-        
-        self.wfile.write(html.encode('utf-8'))
+        return 300  # Default 5 minutes
     
-    def send_error_response(self, code, message):
-        """Send enhanced JSON error response"""
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_cors_headers()
-        self.end_headers()
+    def _compress_content(self, content: bytes, accept_encoding: str) -> tuple[bytes, dict]:
+        """Compress content if client supports it"""
+        if len(content) < 1024:  # Don't compress small content
+            return content, {}
         
-        error_data = {
-            'error': True,
-            'code': code,
-            'message': message,
-            'timestamp': time.time(),
-            'service': 'Solaris Browser Proxy',
-            'version': '2.0.0'
+        headers = {}
+        
+        if 'gzip' in accept_encoding.lower():
+            try:
+                compressed = gzip.compress(content)
+                if len(compressed) < len(content):
+                    headers['Content-Encoding'] = 'gzip'
+                    return compressed, headers
+            except Exception as e:
+                logger.warning(f"Gzip compression failed: {e}")
+        
+        return content, headers
+    
+    async def handle_request(self, request: web.Request) -> web.Response:
+        """Handle proxy request"""
+        await self.init_session()
+        
+        # Get target URL from query parameter
+        query_params = parse_qs(request.query_string)
+        target_urls = query_params.get('url', [])
+        
+        if not target_urls:
+            return web.Response(
+                text="Missing 'url' parameter. Usage: /proxy?url=https://example.com",
+                status=400
+            )
+        
+        target_url = target_urls[0]
+        
+        # Validate URL
+        try:
+            parsed = urlparse(target_url)
+            if not parsed.scheme or not parsed.netloc:
+                return web.Response(text="Invalid URL", status=400)
+            if parsed.scheme not in ('http', 'https'):
+                return web.Response(text="Only HTTP/HTTPS URLs allowed", status=400)
+        except Exception:
+            return web.Response(text="Invalid URL format", status=400)
+        
+        method = request.method
+        
+        # Prepare headers for upstream request
+        upstream_headers = {}
+        for header, value in request.headers.items():
+            if header.lower() in self.forward_headers:
+                upstream_headers[header] = value
+        
+        # Check cache for GET requests
+        cache_key = None
+        if method == 'GET':
+            cache_key = self._get_cache_key(target_url, method, upstream_headers)
+            cached_content = self.cache.get(cache_key)
+            if cached_content:
+                logger.info(f"Cache HIT for {target_url}")
+                
+                # Decompress if needed and recompress based on client's Accept-Encoding
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                content, compression_headers = self._compress_content(cached_content, accept_encoding)
+                
+                response_headers = {
+                    'X-Proxy-Cache': 'HIT',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': '*',
+                    **compression_headers
+                }
+                
+                return web.Response(body=content, headers=response_headers)
+        
+        try:
+            # Make upstream request
+            logger.info(f"Fetching {target_url}")
+            
+            # Prepare request body for POST/PUT requests
+            body = None
+            if method in ('POST', 'PUT', 'PATCH'):
+                body = await request.read()
+            
+            async with self.session.request(
+                method=method,
+                url=target_url,
+                headers=upstream_headers,
+                data=body,
+                allow_redirects=True,
+                max_redirects=5
+            ) as response:
+                
+                # Read response content
+                content = await response.read()
+                
+                # Prepare response headers
+                response_headers = {
+                    'X-Proxy-Cache': 'MISS',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': '*',
+                }
+                
+                # Forward selected headers from upstream response
+                for header, value in response.headers.items():
+                    if header.lower() not in self.exclude_response_headers:
+                        response_headers[header] = value
+                
+                # Cache GET responses if appropriate
+                if (cache_key and self._should_cache(method, response.status, response.headers)):
+                    ttl = self._get_ttl_from_headers(response.headers)
+                    self.cache.set(cache_key, content, ttl)
+                    logger.info(f"Cached {target_url} for {ttl} seconds")
+                
+                # Compress response if client supports it
+                accept_encoding = request.headers.get('Accept-Encoding', '')
+                compressed_content, compression_headers = self._compress_content(content, accept_encoding)
+                response_headers.update(compression_headers)
+                
+                return web.Response(
+                    body=compressed_content,
+                    status=response.status,
+                    headers=response_headers
+                )
+                
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching {target_url}")
+            return web.Response(text="Request timeout", status=504)
+        except aiohttp.ClientError as e:
+            logger.error(f"Client error fetching {target_url}: {e}")
+            return web.Response(text=f"Upstream error: {e}", status=502)
+        except Exception as e:
+            logger.error(f"Unexpected error fetching {target_url}: {e}")
+            return web.Response(text="Internal server error", status=500)
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        """Health check endpoint"""
+        return web.Response(text="OK", status=200)
+    
+    async def handle_cache_stats(self, request: web.Request) -> web.Response:
+        """Cache statistics endpoint"""
+        stats = {
+            'cache_size': len(self.cache.cache),
+            'max_size': self.cache.max_size,
+            'cached_urls': list(self.cache.cache.keys())[:10]  # Show first 10
         }
+        return web.json_response(stats)
+    
+    async def handle_cache_clear(self, request: web.Request) -> web.Response:
+        """Clear cache endpoint"""
+        self.cache.clear()
+        return web.Response(text="Cache cleared", status=200)
+
+async def create_app() -> web.Application:
+    """Create and configure the web application"""
+    proxy = WebProxy()
+    
+    app = web.Application(middlewares=[
+        normalize_path_middleware(append_slash=False, remove_slash=True),
+    ])
+    
+    # Routes
+    app.router.add_route('*', '/proxy', proxy.handle_request)
+    app.router.add_get('/health', proxy.handle_health)
+    app.router.add_get('/cache/stats', proxy.handle_cache_stats)
+    app.router.add_post('/cache/clear', proxy.handle_cache_clear)
+    
+    # Root endpoint with usage info
+    async def handle_root(request):
+        usage_info = """
+        Web Proxy Server
         
-        self.wfile.write(json.dumps(error_data, indent=2).encode())
+        Usage:
+        GET /proxy?url=https://example.com - Proxy GET request
+        POST /proxy?url=https://example.com - Proxy POST request
+        
+        Management:
+        GET /health - Health check
+        GET /cache/stats - Cache statistics
+        POST /cache/clear - Clear cache
+        
+        Features:
+        - In-memory caching with TTL
+        - Gzip compression
+        - CORS headers
+        - Connection pooling
+        - Request/response optimization
+        """
+        return web.Response(text=usage_info, content_type='text/plain')
     
-    def log_message(self, format, *args):
-        """Enhanced logging for Render deployment"""
-        logger.info(f"{self.address_string()} - {format % args}")
-
-class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    """Enhanced threaded server with better configuration"""
-    allow_reuse_address = True
-    daemon_threads = True
-    request_queue_size = 100
+    app.router.add_get('/', handle_root)
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.start_time = time.time()
-
-def create_server(host, port):
-    """Create and configure the enhanced server"""
-    server = ThreadedTCPServer((host, port), SolarisProxyHandler)
+    # Cleanup handler
+    async def cleanup(app):
+        await proxy.close_session()
     
-    # Set socket options for better performance
-    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, 'SO_REUSEPORT'):
-        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    app.on_cleanup.append(cleanup)
     
-    return server
+    return app
 
 def main():
-    """Enhanced main function with better error handling"""
-    # Get configuration from environment
+    """Main entry point"""
     port = int(os.environ.get('PORT', 8080))
-    host = '0.0.0.0'  # Bind to all interfaces for cloud deployment
     
-    try:
-        # Create and configure server
-        server = create_server(host, port)
-        
-        # Enhanced startup logging
-        logger.info("=" * 80)
-        logger.info("🚀 SOLARIS BROWSER PROXY SERVER v2.0.0")
-        logger.info("=" * 80)
-        
-        if 'RENDER' in os.environ:
-            render_hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'your-app.onrender.com')
-            logger.info(f"🌐 Environment: Render.com Production")
-            logger.info(f"📡 External URL: https://{render_hostname}")
-            logger.info(f"🔒 SSL/TLS: Enabled")
-        else:
-            logger.info(f"🏠 Environment: Local Development")
-            logger.info(f"📡 Local URL: http://{host}:{port}")
-            logger.info(f"🔒 SSL/TLS: Disabled")
-        
-        logger.info(f"🔧 Proxy Endpoint: /proxy?url=TARGET_URL")
-        logger.info(f"❤️  Health Check: /health")
-        logger.info(f"🧵 Threading: Enabled ({threading.active_count()} threads)")
-        logger.info("=" * 80)
-        logger.info("✅ Server is ready! Solaris Browser can now connect.")
-        logger.info("🛑 Press Ctrl+C to stop the server")
-        logger.info("=" * 80)
-        
-        # Start the server
-        server.serve_forever()
-        
-    except KeyboardInterrupt:
-        logger.info("\n" + "=" * 80)
-        logger.info("🛑 Server stopped by user (Ctrl+C)")
-        logger.info("=" * 80)
-    except OSError as e:
-        logger.error("=" * 80)
-        logger.error(f"❌ Error starting server: {e}")
-        if "Address already in use" in str(e):
-            logger.error(f"💡 Port {port} is already in use.")
-            if 'RENDER' in os.environ:
-                logger.error("   This usually means another instance is starting on Render.")
-                logger.error("   Wait a moment and try again, or check your Render dashboard.")
-            else:
-                logger.error(f"   Try using a different port: PORT=8081 python3 {__file__}")
-        elif "Permission denied" in str(e):
-            logger.error(f"💡 Permission denied for port {port}.")
-            logger.error("   Try using a port number above 1024.")
-        logger.error("=" * 80)
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-    finally:
-        if 'server' in locals():
-            try:
-                server.shutdown()
-                server.server_close()
-                logger.info("🔄 Server cleanup completed")
-            except:
-                pass
+    app = create_app()
+    
+    logger.info(f"Starting web proxy server on port {port}")
+    web.run_app(app, host='0.0.0.0', port=port)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
