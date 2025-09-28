@@ -37,33 +37,54 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
         self.timeout = 30
         super().__init__(*args, **kwargs)
     
-    def do_GET(self):
-        """Handle GET requests with improved error handling"""
-        try:
-            parsed_path = urlparse(self.path)
+   def do_GET(self):  # Proper indentation
+    """Handle GET requests with improved error handling"""
+    try:
+        parsed_path = urlparse(self.path)
+        
+        # Enhanced malformed URL detection - catch more patterns
+        malformed_patterns = [
+            '/=', '/?url=', '?url==', '&url==', 'url===', 
+            '/proxy?url=https%3A//twitter.com/=', 
+            '/proxy?url=https%3A//google.com/='
+        ]
+        
+        # Check for malformed URLs more thoroughly
+        is_malformed = (
+            any(pattern in self.path for pattern in malformed_patterns) or 
+            self.path.endswith('=') or 
+            '==' in self.path or
+            '/=' in self.path or
+            re.search(r'url=[^&]*=$', self.path)  # URL parameter ending with just =
+        )
+        
+        if is_malformed:
+            logger.warning(f"Malformed URL request blocked: {self.path}")
+            self.send_error_response(400, "Malformed URL - request rejected")
+            return
+        
+        # Handle relative URLs with better logic
+        if (not parsed_path.path.startswith('/proxy') and 
+            not parsed_path.path.startswith('/health') and 
+            parsed_path.path not in ['/', '']):
             
-            # Enhanced malformed URL detection - catch more patterns
-            # Enhanced malformed URL detection - catch more patterns
-            malformed_patterns = [
-                '/=', '/?url=', '?url==', '&url==', 'url===', 
-                '/proxy?url=https%3A//twitter.com/=', 
-                '/proxy?url=https%3A//google.com/='
-            ]
+            self._handle_relative_url(parsed_path)
+            return
+        
+        # Route requests
+        if parsed_path.path == '/proxy':
+            self.handle_proxy_request(parsed_path)
+        elif parsed_path.path == '/health':
+            self.handle_health_check()
+        elif parsed_path.path == '/' or parsed_path.path == '':
+            self.serve_status_page()
+        else:
+            self.send_error_response(404, "Endpoint not found")
             
-            # Check for malformed URLs more thoroughly
-            is_malformed = (
-                any(pattern in self.path for pattern in malformed_patterns) or 
-                self.path.endswith('=') or 
-                '==' in self.path or
-                '/=' in self.path or
-                re.search(r'url=[^&]*=$', self.path)  # URL parameter ending with just =
-            )
-            
-            if is_malformed:
-                logger.warning(f"Malformed URL request blocked: {self.path}")
-                self.send_error_response(400, "Malformed URL - request rejected")
-                return
-    
+    except Exception as e:
+        logger.error(f"Error in GET request: {str(e)}")
+        self.send_error_response(500, "Internal server error")
+        
     def do_POST(self):
         """Handle POST requests through proxy"""
         try:
@@ -1312,123 +1333,169 @@ if __name__ == "__main__":
             logger.error(f"Error processing response: {e}")
             raise
     
-    def _modify_html_for_proxy(self, html_content, base_url):
-        """Modify HTML content to work through the proxy"""
-        try:
-            logger.info(f"Processing HTML content, length: {len(html_content)}")
+def _modify_html_for_proxy(self, html_content, base_url):
+    """Modify HTML content to work through the proxy"""
+    try:
+        logger.info(f"Processing HTML content, length: {len(html_content)}")
+        
+        # Get proxy base URL
+        host = self.headers.get('Host', 'localhost:8080')
+        # Use HTTPS for Render deployment
+        proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
+        
+        # Parse base URL
+        parsed_base = urlparse(base_url)
+        base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
+        
+        # Function to replace URLs with better validation
+        def replace_url(match):
+            attr = match.group(1)
+            url = match.group(2)
             
-            # Get proxy base URL
-            host = self.headers.get('Host', 'localhost:8080')
-            # Use HTTPS for Render deployment
-            proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
-            
-            # Parse base URL
-            parsed_base = urlparse(base_url)
-            base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
-            
-            # Function to replace URLs with better validation
-            def replace_url(match):
-                attr = match.group(1)
-                url = match.group(2)
-                
-                # Skip certain URL types and malformed URLs
-                skip_prefixes = ['javascript:', 'mailto:', 'tel:', 'data:', '#', 'about:', 'blob:', 'chrome:', 'moz-extension:']
-                if any(url.lower().startswith(prefix) for prefix in skip_prefixes):
-                    return match.group(0)
-                
-                # Skip empty URLs or just whitespace
-                if not url.strip():
-                    return match.group(0)
-                
-                # Skip URLs that end with just '=' (malformed)
-                if url.strip() == '=' or url.endswith('/='):
-                    logger.warning(f"Skipping malformed URL: {url}")
-                    return match.group(0)
-                
-                # Clean up the URL
-                url = url.strip()
-                
-                # Convert relative URL to absolute
-                if not url.startswith(('http://', 'https://')):
-                    try:
-                        url = urllib.parse.urljoin(base_url, url)
-                    except Exception as e:
-                        logger.warning(f"Failed to join URL {url}: {e}")
-                        return match.group(0)
-                
-                # Validate the resulting URL
-                if not self.is_valid_url(url):
-                    logger.warning(f"Invalid URL after processing: {url}")
-                    return match.group(0)
-                
-                # Create proxy URL
-                try:
-                    encoded_url = urllib.parse.quote(url, safe=':/?#[]@!    def _modify_html_for_proxy(self, html_content, base_url):
-        """Modify HTML content to work through the proxy"""
-        try:
-            logger.info(f"Processing HTML content, length: {len(html_content)}")
-            
-            # Get proxy base URL
-            host = self.headers.get('Host', 'localhost:8080')
-            # Use HTTPS for Render deployment
-            proxy_base = f"https://{host}" if 'RENDER' in os.environ else f"http://{host}"
-            
-            # Parse base URL
-            parsed_base = urlparse(base_url)
-            base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
-            
-            # Function to replace URLs
-            def replace_url(match):
-                attr = match.group(1)
-                url = match.group(2)
-                
-                # Skip certain URL types
-                skip_prefixes = ['javascript:', 'mailto:', 'tel:', 'data:', '#', 'about:', 'blob:']
-                if any(url.lower().startswith(prefix) for prefix in skip_prefixes):
-                    return match.group(0)
-                
-                # Convert relative URL to absolute
-                if not url.startswith(('http://', 'https://')):
-                    url = urllib.parse.urljoin(base_url, url)
-                
-                # Create proxy URL
-                encoded_url = urllib.parse.quote(url, safe='')
-                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                return f'{attr}="{proxy_url}"'
-            
-            # Replace URLs in various attributes
-            url_attributes = ['href', 'src', 'action', 'data-src', 'data-url']
-            pattern = f'((?:{"|".join(url_attributes)})\\s*=\\s*["\'])([^"\']+)(["\'])'
-            html_content = re.sub(pattern, replace_url, html_content, flags=re.IGNORECASE)
-            
-            # Handle CSS url() functions
-            def replace_css_url(match):
-                url = match.group(1).strip('\'"')
-                if not url.startswith(('http://', 'https://', 'data:', '#', 'blob:')):
-                    url = urllib.parse.urljoin(base_url, url)
-                    encoded_url = urllib.parse.quote(url, safe='')
-                    proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
-                    return f'url("{proxy_url}")'
+            # Skip certain URL types and malformed URLs
+            skip_prefixes = ['javascript:', 'mailto:', 'tel:', 'data:', '#', 'about:', 'blob:', 'chrome:', 'moz-extension:']
+            if any(url.lower().startswith(prefix) for prefix in skip_prefixes):
                 return match.group(0)
             
-            html_content = re.sub(r'url\(\s*([^)]+)\s*\)', replace_css_url, html_content, flags=re.IGNORECASE)
+            # Skip empty URLs or just whitespace
+            if not url.strip():
+                return match.group(0)
             
-            # Add base tag for better relative URL resolution
-            if '<head>' in html_content.lower():
-                base_tag = f'<base href="{base_domain}/">'
-                html_content = re.sub(
-                    r'(<head[^>]*>)',
-                    f'\\1\n{base_tag}',
-                    html_content,
-                    flags=re.IGNORECASE,
-                    count=1
-                )
+            # Skip URLs that end with just '=' (malformed)
+            if url.strip() == '=' or url.endswith('/='):
+                logger.warning(f"Skipping malformed URL: {url}")
+                return match.group(0)
             
-            return html_content
+            # Clean up the URL
+            url = url.strip()
             
-        except Exception as e:
-            logger.error(f"Error modifying HTML content: {e}")
-            return html_content\'()*+,;=')
+            # Convert relative URL to absolute
+            if not url.startswith(('http://', 'https://')):
+                try:
+                    url = urllib.parse.urljoin(base_url, url)
+                except Exception as e:
+                    logger.warning(f"Failed to join URL {url}: {e}")
+                    return match.group(0)
+            
+            # Validate the resulting URL
+            if not self.is_valid_url(url):
+                logger.warning(f"Invalid URL after processing: {url}")
+                return match.group(0)
+            
+            # Create proxy URL
+            try:
+                encoded_url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')
+                proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
+                return f'{attr}="{proxy_url}"'
+            except Exception as e:
+                logger.warning(f"Failed to encode URL {url}: {e}")
+                return match.group(0)
+        
+        # Replace URLs in various attributes with stricter pattern
+        url_attributes = ['href', 'src', 'action', 'data-src', 'data-url', 'data-href']
+        pattern = f'((?:{"|".join(url_attributes)})\\s*=\\s*["\'])([^"\'\\s>]+)(["\'])'
+        html_content = re.sub(pattern, replace_url, html_content, flags=re.IGNORECASE)
+        
+        # Handle CSS url() functions with better validation
+        def replace_css_url(match):
+            url = match.group(1).strip('\'"')
+            
+            # Skip problematic URLs
+            if (not url.strip() or 
+                url.startswith(('data:', '#', 'blob:', 'javascript:')) or
+                url.strip() == '=' or 
+                url.endswith('/=')):
+                return match.group(0)
+            
+            try:
+                if not url.startswith(('http://', 'https://')):
+                    url = urllib.parse.urljoin(base_url, url)
+                
+                if self.is_valid_url(url):
+                    encoded_url = urllib.parse.quote(url, safe=':/?#[]@!$&\'()*+,;=')
+                    proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
+                    return f'url("{proxy_url}")'
+            except Exception as e:
+                logger.warning(f"Failed to process CSS URL {url}: {e}")
+            
+            return match.group(0)
+        
+        html_content = re.sub(r'url\(\s*([^)]+)\s*\)', replace_css_url, html_content, flags=re.IGNORECASE)
+        
+        # Add JavaScript to handle dynamic URL requests and prevent CORS issues
+        js_injection = f'''
+<script>
+(function() {{
+    'use strict';
+    
+    // Override XMLHttpRequest to proxy requests
+    const originalXHR = window.XMLHttpRequest;
+    function ProxiedXMLHttpRequest() {{
+        const xhr = new originalXHR();
+        const originalOpen = xhr.open;
+        
+        xhr.open = function(method, url, async, user, password) {{
+            // Only proxy absolute URLs
+            if (url && (url.startsWith('http://') || url.startsWith('https://'))) {{
+                const proxyUrl = "{proxy_base}/proxy?url=" + encodeURIComponent(url);
+                return originalOpen.call(this, method, proxyUrl, async, user, password);
+            }}
+            return originalOpen.call(this, method, url, async, user, password);
+        }};
+        
+        return xhr;
+    }}
+    
+    // Copy properties from original constructor
+    Object.setPrototypeOf(ProxiedXMLHttpRequest.prototype, originalXHR.prototype);
+    Object.setPrototypeOf(ProxiedXMLHttpRequest, originalXHR);
+    Object.defineProperty(window, 'XMLHttpRequest', {{
+        value: ProxiedXMLHttpRequest,
+        writable: true,
+        configurable: true
+    }});
+    
+    // Override fetch API
+    const originalFetch = window.fetch;
+    window.fetch = function(resource, options) {{
+        if (typeof resource === 'string' && (resource.startsWith('http://') || resource.startsWith('https://'))) {{
+            const proxyUrl = "{proxy_base}/proxy?url=" + encodeURIComponent(resource);
+            return originalFetch(proxyUrl, options);
+        }}
+        return originalFetch(resource, options);
+    }};
+    
+    console.log('Solaris proxy scripts injected');
+}})();
+</script>
+'''
+        
+        # Add base tag and JavaScript injection
+        if '<head>' in html_content.lower():
+            base_tag = f'<base href="{base_domain}/">'
+            injection = f'\n{base_tag}\n{js_injection}'
+            html_content = re.sub(
+                r'(<head[^>]*>)',
+                f'\\1{injection}',
+                html_content,
+                flags=re.IGNORECASE,
+                count=1
+            )
+        elif '<html>' in html_content.lower():
+            # If no head tag, add after html tag
+            html_content = re.sub(
+                r'(<html[^>]*>)',
+                f'\\1\n<head>{js_injection}</head>',
+                html_content,
+                flags=re.IGNORECASE,
+                count=1
+            )
+        
+        return html_content
+        
+    except Exception as e:
+        logger.error(f"Error modifying HTML content: {e}")
+        return html_content
                     proxy_url = f"{proxy_base}/proxy?url={encoded_url}"
                     return f'{attr}="{proxy_url}"'
                 except Exception as e:
