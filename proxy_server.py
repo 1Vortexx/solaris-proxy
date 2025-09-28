@@ -43,14 +43,26 @@ class SolarisProxyHandler(http.server.BaseHTTPRequestHandler):
             parsed_path = urlparse(self.path)
             
             # Enhanced malformed URL detection - catch more patterns
-            malformed_patterns = ['/=', '/?url=', '?url==', '&url==', 'url===', '/proxy?url=https%3A//twitter.com/=', '/proxy?url=https%3A//google.com/=']
+            # Enhanced malformed URL detection - catch more patterns
+            malformed_patterns = [
+                '/=', '/?url=', '?url==', '&url==', 'url===', 
+                '/proxy?url=https%3A//twitter.com/=', 
+                '/proxy?url=https%3A//google.com/='
+            ]
             
             # Check for malformed URLs more thoroughly
-            if (any(pattern in self.path for pattern in malformed_patterns) or 
+            is_malformed = (
+                any(pattern in self.path for pattern in malformed_patterns) or 
                 self.path.endswith('=') or 
                 '==' in self.path or
                 '/=' in self.path or
-                re.search(r'url=[^&]*=
+                re.search(r'url=[^&]*=$', self.path)  # URL parameter ending with just =
+            )
+            
+            if is_malformed:
+                logger.warning(f"Malformed URL request blocked: {self.path}")
+                self.send_error_response(400, "Malformed URL - request rejected")
+                return
     
     def do_POST(self):
         """Handle POST requests through proxy"""
